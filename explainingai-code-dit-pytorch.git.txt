@@ -1,0 +1,2188 @@
+Directory structure:
+└── explainingai-code-dit-pytorch.git/
+    ├── requirements.txt
+    ├── config/
+    │   └── celebhq.yaml
+    ├── dataset/
+    │   ├── __init__.py
+    │   └── celeb_dataset.py
+    ├── model/
+    │   ├── __init__.py
+    │   ├── attention.py
+    │   ├── blocks.py
+    │   ├── discriminator.py
+    │   ├── lpips.py
+    │   ├── patch_embed.py
+    │   ├── transformer.py
+    │   ├── transformer_layer.py
+    │   ├── vae.py
+    │   └── weights/
+    │       └── v0.1/
+    │           └── .gitkeep
+    ├── scheduler/
+    │   ├── __init__.py
+    │   └── linear_scheduler.py
+    ├── tools/
+    │   ├── __init__.py
+    │   ├── infer_vae.py
+    │   ├── sample_vae_dit.py
+    │   ├── train_vae.py
+    │   └── train_vae_dit.py
+    └── utils/
+        ├── __init__.py
+        └── diffusion_utils.py
+
+================================================
+FILE: requirements.txt
+================================================
+einops==0.8.0
+numpy==2.0.1
+opencv_python==4.10.0.84
+Pillow==10.4.0
+PyYAML==6.0.1
+torch==2.3.1
+torchvision==0.18.1
+tqdm==4.66.4
+
+
+
+================================================
+FILE: config/celebhq.yaml
+================================================
+dataset_params:
+  im_path: 'data/CelebAMask-HQ'
+  im_size : 128
+  im_channels : 3
+
+diffusion_params:
+  num_timesteps : 1000
+  beta_start : 0.0001
+  beta_end : 0.02
+
+dit_params:
+  patch_size : 2
+  num_layers : 12
+  hidden_size : 768
+  num_heads : 12
+  head_dim : 64
+  timestep_emb_dim : 768
+
+autoencoder_params:
+  z_channels: 4
+  codebook_size : 8192
+  down_channels : [128, 256, 384]
+  mid_channels : [384]
+  down_sample : [True, True]
+  attn_down : [False, False]
+  norm_channels: 32
+  num_heads: 4
+  num_down_layers : 2
+  num_mid_layers : 2
+  num_up_layers : 2
+
+
+train_params:
+  seed : 1111
+  task_name: 'celebhq'
+  autoencoder_batch_size: 4
+  autoencoder_epochs: 3
+  autoencoder_lr: 0.00001
+  autoencoder_acc_steps: 1
+  disc_start: 7500
+  disc_weight: 0.5
+  codebook_weight: 1
+  commitment_beta: 0.2
+  perceptual_weight: 1
+  kl_weight: 0.000005
+  autoencoder_img_save_steps: 64
+  save_latents: False
+  dit_batch_size: 32
+  dit_epochs: 500
+  num_samples: 1
+  num_grid_rows: 2
+  dit_lr: 0.00001
+  dit_acc_steps: 1
+  vae_latent_dir_name: 'vae_latents'
+  dit_ckpt_name: 'dit_ckpt.pth'
+  vae_autoencoder_ckpt_name: 'vae_autoencoder_ckpt.pth'
+  vae_discriminator_ckpt_name: 'vae_discriminator_ckpt.pth'
+
+
+
+================================================
+FILE: dataset/__init__.py
+================================================
+
+
+
+================================================
+FILE: dataset/celeb_dataset.py
+================================================
+import glob
+import os
+import cv2
+import torchvision
+import numpy as np
+from PIL import Image
+from utils.diffusion_utils import load_latents
+from tqdm import tqdm
+from torch.utils.data.dataset import Dataset
+
+
+class CelebDataset(Dataset):
+    r"""
+    Celeb dataset will by default centre crop and resize the images.
+    This can be replaced by any other dataset. As long as all the images
+    are under one directory.
+    """
+
+    def __init__(self, split, im_path, im_size=256, im_channels=3, im_ext='jpg',
+                 use_latents=False, latent_path=None):
+        self.split = split
+        self.im_size = im_size
+        self.im_channels = im_channels
+        self.im_ext = im_ext
+        self.im_path = im_path
+        self.latent_maps = None
+        self.use_latents = False
+
+        self.images = self.load_images(im_path)
+
+        # Whether to load images or to load latents
+        if use_latents and latent_path is not None:
+            latent_maps = load_latents(latent_path)
+            if len(latent_maps) == len(self.images):
+                self.use_latents = True
+                self.latent_maps = latent_maps
+                print('Found {} latents'.format(len(self.latent_maps)))
+            else:
+                print('Latents not found')
+
+    def load_images(self, im_path):
+        r"""
+        Gets all images from the path specified
+        and stacks them all up
+        """
+        assert os.path.exists(im_path), "images path {} does not exist".format(im_path)
+        ims = []
+        fnames = glob.glob(os.path.join(im_path, 'CelebA-HQ-img/*.{}'.format('png')))
+        fnames += glob.glob(os.path.join(im_path, 'CelebA-HQ-img/*.{}'.format('jpg')))
+        fnames += glob.glob(os.path.join(im_path, 'CelebA-HQ-img/*.{}'.format('jpeg')))
+
+        for fname in tqdm(fnames):
+            ims.append(fname)
+
+        print('Found {} images'.format(len(ims)))
+        return ims
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, index):
+        if self.use_latents:
+            latent = self.latent_maps[self.images[index]]
+            return latent
+
+        else:
+            im = Image.open(self.images[index])
+            im_tensor = torchvision.transforms.Compose([
+                torchvision.transforms.Resize(self.im_size),
+                torchvision.transforms.CenterCrop(self.im_size),
+                torchvision.transforms.ToTensor(),
+            ])(im)
+            im.close()
+
+            # Convert input to -1 to 1 range.
+            im_tensor = (2 * im_tensor) - 1
+
+            return im_tensor
+
+
+
+================================================
+FILE: model/__init__.py
+================================================
+
+
+
+================================================
+FILE: model/attention.py
+================================================
+import torch
+import torch.nn as nn
+from einops import rearrange
+
+
+class Attention(nn.Module):
+    r"""
+    Attention Module for DiT.
+    This is same as VIT code and does not have any changes
+    from it.
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.n_heads = config['num_heads']
+        self.hidden_size = config['hidden_size']
+        self.head_dim = config['head_dim']
+
+        self.att_dim = self.n_heads * self.head_dim
+
+        # QKV projection for the input
+        self.qkv_proj = nn.Linear(self.hidden_size, 3 * self.att_dim, bias=True)
+        self.output_proj = nn.Sequential(
+            nn.Linear(self.att_dim, self.hidden_size))
+
+        ############################
+        # DiT Layer Initialization #
+        ############################
+        nn.init.xavier_uniform_(self.qkv_proj.weight)
+        nn.init.constant_(self.qkv_proj.bias, 0)
+        nn.init.xavier_uniform_(self.output_proj[0].weight)
+        nn.init.constant_(self.output_proj[0].bias, 0)
+
+    def forward(self, x):
+        #  Converting to Attention Dimension
+        ######################################################
+        # Batch Size x Number of Patches x Dimension
+        B, N = x.shape[:2]
+        # Projecting to 3*att_dim and then splitting to get q, k v(each of att_dim)
+        # qkv -> Batch Size x Number of Patches x (3* Attention Dimension)
+        # q(as well as k and v) -> Batch Size x Number of Patches x Attention Dimension
+        q, k, v = self.qkv_proj(x).split(self.att_dim, dim=-1)
+        # Batch Size x Number of Patches x Attention Dimension
+        # -> Batch Size x Number of Patches x (Heads * Head Dimension)
+        # -> Batch Size x Number of Patches x (Heads * Head Dimension)
+        # -> Batch Size x Heads x Number of Patches x Head Dimension
+        # -> B x H x N x Head Dimension
+        q = rearrange(q, 'b n (n_h h_dim) -> b n_h n h_dim',
+                      n_h=self.n_heads, h_dim=self.head_dim)
+        k = rearrange(k, 'b n (n_h h_dim) -> b n_h n h_dim',
+                      n_h=self.n_heads, h_dim=self.head_dim)
+        v = rearrange(v, 'b n (n_h h_dim) -> b n_h n h_dim',
+                      n_h=self.n_heads, h_dim=self.head_dim)
+        #########################################################
+
+        # Compute Attention Weights
+        #########################################################
+        # B x H x N x Head Dimension @ B x H x Head Dimension x N
+        # -> B x H x N x N
+        att = torch.matmul(q, k.transpose(-2, -1)) * (self.head_dim ** (-0.5))
+        att = torch.nn.functional.softmax(att, dim=-1)
+        #########################################################
+
+        # Weighted Value Computation
+        #########################################################
+        #  B x H x N x N @ B x H x N x Head Dimension
+        # -> B x H x N x Head Dimension
+        out = torch.matmul(att, v)
+        #########################################################
+
+        # Converting to Transformer Dimension
+        #########################################################
+        # B x N x (Heads * Head Dimension) -> B x N x (Attention Dimension)
+        out = rearrange(out, 'b n_h n h_dim -> b n (n_h h_dim)')
+        #  B x N x Dimension
+        out = self.output_proj(out)
+        ##########################################################
+
+        return out
+
+
+
+================================================
+FILE: model/blocks.py
+================================================
+import torch
+import torch.nn as nn
+
+
+def get_time_embedding(time_steps, temb_dim):
+    r"""
+    Convert time steps tensor into an embedding using the
+    sinusoidal time embedding formula
+    :param time_steps: 1D tensor of length batch size
+    :param temb_dim: Dimension of the embedding
+    :return: BxD embedding representation of B time steps
+    """
+    assert temb_dim % 2 == 0, "time embedding dimension must be divisible by 2"
+
+    # factor = 10000^(2i/d_model)
+    factor = 10000 ** ((torch.arange(
+        start=0, end=temb_dim // 2, dtype=torch.float32, device=time_steps.device) / (temb_dim // 2))
+    )
+
+    # pos / factor
+    # timesteps B -> B, 1 -> B, temb_dim
+    t_emb = time_steps[:, None].repeat(1, temb_dim // 2) / factor
+    t_emb = torch.cat([torch.sin(t_emb), torch.cos(t_emb)], dim=-1)
+    return t_emb
+
+
+class DownBlock(nn.Module):
+    r"""
+    Down conv block with attention.
+    Sequence of following block
+    1. Resnet block with time embedding
+    2. Attention block
+    3. Downsample
+    """
+
+    def __init__(self, in_channels, out_channels, t_emb_dim,
+                 down_sample, num_heads, num_layers, attn, norm_channels, cross_attn=False, context_dim=None):
+        super().__init__()
+        self.num_layers = num_layers
+        self.down_sample = down_sample
+        self.attn = attn
+        self.context_dim = context_dim
+        self.cross_attn = cross_attn
+        self.t_emb_dim = t_emb_dim
+        self.resnet_conv_first = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.GroupNorm(norm_channels, in_channels if i == 0 else out_channels),
+                    nn.SiLU(),
+                    nn.Conv2d(in_channels if i == 0 else out_channels, out_channels,
+                              kernel_size=3, stride=1, padding=1),
+                )
+                for i in range(num_layers)
+            ]
+        )
+        if self.t_emb_dim is not None:
+            self.t_emb_layers = nn.ModuleList([
+                nn.Sequential(
+                    nn.SiLU(),
+                    nn.Linear(self.t_emb_dim, out_channels)
+                )
+                for _ in range(num_layers)
+            ])
+        self.resnet_conv_second = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.GroupNorm(norm_channels, out_channels),
+                    nn.SiLU(),
+                    nn.Conv2d(out_channels, out_channels,
+                              kernel_size=3, stride=1, padding=1),
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+        if self.attn:
+            self.attention_norms = nn.ModuleList(
+                [nn.GroupNorm(norm_channels, out_channels)
+                 for _ in range(num_layers)]
+            )
+
+            self.attentions = nn.ModuleList(
+                [nn.MultiheadAttention(out_channels, num_heads, batch_first=True)
+                 for _ in range(num_layers)]
+            )
+
+        if self.cross_attn:
+            assert context_dim is not None, "Context Dimension must be passed for cross attention"
+            self.cross_attention_norms = nn.ModuleList(
+                [nn.GroupNorm(norm_channels, out_channels)
+                 for _ in range(num_layers)]
+            )
+            self.cross_attentions = nn.ModuleList(
+                [nn.MultiheadAttention(out_channels, num_heads, batch_first=True)
+                 for _ in range(num_layers)]
+            )
+            self.context_proj = nn.ModuleList(
+                [nn.Linear(context_dim, out_channels)
+                 for _ in range(num_layers)]
+            )
+
+        self.residual_input_conv = nn.ModuleList(
+            [
+                nn.Conv2d(in_channels if i == 0 else out_channels, out_channels, kernel_size=1)
+                for i in range(num_layers)
+            ]
+        )
+        self.down_sample_conv = nn.Conv2d(out_channels, out_channels,
+                                          4, 2, 1) if self.down_sample else nn.Identity()
+
+    def forward(self, x, t_emb=None, context=None):
+        out = x
+        for i in range(self.num_layers):
+            # Resnet block of Unet
+            resnet_input = out
+            out = self.resnet_conv_first[i](out)
+            if self.t_emb_dim is not None:
+                out = out + self.t_emb_layers[i](t_emb)[:, :, None, None]
+            out = self.resnet_conv_second[i](out)
+            out = out + self.residual_input_conv[i](resnet_input)
+
+            if self.attn:
+                # Attention block of Unet
+                batch_size, channels, h, w = out.shape
+                in_attn = out.reshape(batch_size, channels, h * w)
+                in_attn = self.attention_norms[i](in_attn)
+                in_attn = in_attn.transpose(1, 2)
+                out_attn, _ = self.attentions[i](in_attn, in_attn, in_attn)
+                out_attn = out_attn.transpose(1, 2).reshape(batch_size, channels, h, w)
+                out = out + out_attn
+
+            if self.cross_attn:
+                assert context is not None, "context cannot be None if cross attention layers are used"
+                batch_size, channels, h, w = out.shape
+                in_attn = out.reshape(batch_size, channels, h * w)
+                in_attn = self.cross_attention_norms[i](in_attn)
+                in_attn = in_attn.transpose(1, 2)
+                assert context.shape[0] == x.shape[0] and context.shape[-1] == self.context_dim
+                context_proj = self.context_proj[i](context)
+                out_attn, _ = self.cross_attentions[i](in_attn, context_proj, context_proj)
+                out_attn = out_attn.transpose(1, 2).reshape(batch_size, channels, h, w)
+                out = out + out_attn
+
+        # Downsample
+        out = self.down_sample_conv(out)
+        return out
+
+
+class MidBlock(nn.Module):
+    r"""
+    Mid conv block with attention.
+    Sequence of following blocks
+    1. Resnet block with time embedding
+    2. Attention block
+    3. Resnet block with time embedding
+    """
+
+    def __init__(self, in_channels, out_channels, t_emb_dim, num_heads, num_layers, norm_channels, cross_attn=None,
+                 context_dim=None):
+        super().__init__()
+        self.num_layers = num_layers
+        self.t_emb_dim = t_emb_dim
+        self.context_dim = context_dim
+        self.cross_attn = cross_attn
+        self.resnet_conv_first = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.GroupNorm(norm_channels, in_channels if i == 0 else out_channels),
+                    nn.SiLU(),
+                    nn.Conv2d(in_channels if i == 0 else out_channels, out_channels, kernel_size=3, stride=1,
+                              padding=1),
+                )
+                for i in range(num_layers + 1)
+            ]
+        )
+
+        if self.t_emb_dim is not None:
+            self.t_emb_layers = nn.ModuleList([
+                nn.Sequential(
+                    nn.SiLU(),
+                    nn.Linear(t_emb_dim, out_channels)
+                )
+                for _ in range(num_layers + 1)
+            ])
+        self.resnet_conv_second = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.GroupNorm(norm_channels, out_channels),
+                    nn.SiLU(),
+                    nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1),
+                )
+                for _ in range(num_layers + 1)
+            ]
+        )
+
+        self.attention_norms = nn.ModuleList(
+            [nn.GroupNorm(norm_channels, out_channels)
+             for _ in range(num_layers)]
+        )
+
+        self.attentions = nn.ModuleList(
+            [nn.MultiheadAttention(out_channels, num_heads, batch_first=True)
+             for _ in range(num_layers)]
+        )
+        if self.cross_attn:
+            assert context_dim is not None, "Context Dimension must be passed for cross attention"
+            self.cross_attention_norms = nn.ModuleList(
+                [nn.GroupNorm(norm_channels, out_channels)
+                 for _ in range(num_layers)]
+            )
+            self.cross_attentions = nn.ModuleList(
+                [nn.MultiheadAttention(out_channels, num_heads, batch_first=True)
+                 for _ in range(num_layers)]
+            )
+            self.context_proj = nn.ModuleList(
+                [nn.Linear(context_dim, out_channels)
+                 for _ in range(num_layers)]
+            )
+        self.residual_input_conv = nn.ModuleList(
+            [
+                nn.Conv2d(in_channels if i == 0 else out_channels, out_channels, kernel_size=1)
+                for i in range(num_layers + 1)
+            ]
+        )
+
+    def forward(self, x, t_emb=None, context=None):
+        out = x
+
+        # First resnet block
+        resnet_input = out
+        out = self.resnet_conv_first[0](out)
+        if self.t_emb_dim is not None:
+            out = out + self.t_emb_layers[0](t_emb)[:, :, None, None]
+        out = self.resnet_conv_second[0](out)
+        out = out + self.residual_input_conv[0](resnet_input)
+
+        for i in range(self.num_layers):
+            # Attention Block
+            batch_size, channels, h, w = out.shape
+            in_attn = out.reshape(batch_size, channels, h * w)
+            in_attn = self.attention_norms[i](in_attn)
+            in_attn = in_attn.transpose(1, 2)
+            out_attn, _ = self.attentions[i](in_attn, in_attn, in_attn)
+            out_attn = out_attn.transpose(1, 2).reshape(batch_size, channels, h, w)
+            out = out + out_attn
+
+            if self.cross_attn:
+                assert context is not None, "context cannot be None if cross attention layers are used"
+                batch_size, channels, h, w = out.shape
+                in_attn = out.reshape(batch_size, channels, h * w)
+                in_attn = self.cross_attention_norms[i](in_attn)
+                in_attn = in_attn.transpose(1, 2)
+                assert context.shape[0] == x.shape[0] and context.shape[-1] == self.context_dim
+                context_proj = self.context_proj[i](context)
+                out_attn, _ = self.cross_attentions[i](in_attn, context_proj, context_proj)
+                out_attn = out_attn.transpose(1, 2).reshape(batch_size, channels, h, w)
+                out = out + out_attn
+
+            # Resnet Block
+            resnet_input = out
+            out = self.resnet_conv_first[i + 1](out)
+            if self.t_emb_dim is not None:
+                out = out + self.t_emb_layers[i + 1](t_emb)[:, :, None, None]
+            out = self.resnet_conv_second[i + 1](out)
+            out = out + self.residual_input_conv[i + 1](resnet_input)
+
+        return out
+
+
+class UpBlock(nn.Module):
+    r"""
+    Up conv block with attention.
+    Sequence of following blocks
+    1. Upsample
+    1. Concatenate Down block output
+    2. Resnet block with time embedding
+    3. Attention Block
+    """
+
+    def __init__(self, in_channels, out_channels, t_emb_dim,
+                 up_sample, num_heads, num_layers, attn, norm_channels):
+        super().__init__()
+        self.num_layers = num_layers
+        self.up_sample = up_sample
+        self.t_emb_dim = t_emb_dim
+        self.attn = attn
+        self.resnet_conv_first = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.GroupNorm(norm_channels, in_channels if i == 0 else out_channels),
+                    nn.SiLU(),
+                    nn.Conv2d(in_channels if i == 0 else out_channels, out_channels, kernel_size=3, stride=1,
+                              padding=1),
+                )
+                for i in range(num_layers)
+            ]
+        )
+
+        if self.t_emb_dim is not None:
+            self.t_emb_layers = nn.ModuleList([
+                nn.Sequential(
+                    nn.SiLU(),
+                    nn.Linear(t_emb_dim, out_channels)
+                )
+                for _ in range(num_layers)
+            ])
+
+        self.resnet_conv_second = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.GroupNorm(norm_channels, out_channels),
+                    nn.SiLU(),
+                    nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1),
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        if self.attn:
+            self.attention_norms = nn.ModuleList(
+                [
+                    nn.GroupNorm(norm_channels, out_channels)
+                    for _ in range(num_layers)
+                ]
+            )
+
+            self.attentions = nn.ModuleList(
+                [
+                    nn.MultiheadAttention(out_channels, num_heads, batch_first=True)
+                    for _ in range(num_layers)
+                ]
+            )
+
+        self.residual_input_conv = nn.ModuleList(
+            [
+                nn.Conv2d(in_channels if i == 0 else out_channels, out_channels, kernel_size=1)
+                for i in range(num_layers)
+            ]
+        )
+        self.up_sample_conv = nn.ConvTranspose2d(in_channels, in_channels,
+                                                 4, 2, 1) \
+            if self.up_sample else nn.Identity()
+
+    def forward(self, x, out_down=None, t_emb=None):
+        # Upsample
+        x = self.up_sample_conv(x)
+
+        # Concat with Downblock output
+        if out_down is not None:
+            x = torch.cat([x, out_down], dim=1)
+
+        out = x
+        for i in range(self.num_layers):
+            # Resnet Block
+            resnet_input = out
+            out = self.resnet_conv_first[i](out)
+            if self.t_emb_dim is not None:
+                out = out + self.t_emb_layers[i](t_emb)[:, :, None, None]
+            out = self.resnet_conv_second[i](out)
+            out = out + self.residual_input_conv[i](resnet_input)
+
+            # Self Attention
+            if self.attn:
+                batch_size, channels, h, w = out.shape
+                in_attn = out.reshape(batch_size, channels, h * w)
+                in_attn = self.attention_norms[i](in_attn)
+                in_attn = in_attn.transpose(1, 2)
+                out_attn, _ = self.attentions[i](in_attn, in_attn, in_attn)
+                out_attn = out_attn.transpose(1, 2).reshape(batch_size, channels, h, w)
+                out = out + out_attn
+        return out
+
+
+class UpBlockUnet(nn.Module):
+    r"""
+    Up conv block with attention.
+    Sequence of following blocks
+    1. Upsample
+    1. Concatenate Down block output
+    2. Resnet block with time embedding
+    3. Attention Block
+    """
+
+    def __init__(self, in_channels, out_channels, t_emb_dim, up_sample,
+                 num_heads, num_layers, norm_channels, cross_attn=False, context_dim=None):
+        super().__init__()
+        self.num_layers = num_layers
+        self.up_sample = up_sample
+        self.t_emb_dim = t_emb_dim
+        self.cross_attn = cross_attn
+        self.context_dim = context_dim
+        self.resnet_conv_first = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.GroupNorm(norm_channels, in_channels if i == 0 else out_channels),
+                    nn.SiLU(),
+                    nn.Conv2d(in_channels if i == 0 else out_channels, out_channels, kernel_size=3, stride=1,
+                              padding=1),
+                )
+                for i in range(num_layers)
+            ]
+        )
+
+        if self.t_emb_dim is not None:
+            self.t_emb_layers = nn.ModuleList([
+                nn.Sequential(
+                    nn.SiLU(),
+                    nn.Linear(t_emb_dim, out_channels)
+                )
+                for _ in range(num_layers)
+            ])
+
+        self.resnet_conv_second = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.GroupNorm(norm_channels, out_channels),
+                    nn.SiLU(),
+                    nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1),
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+        self.attention_norms = nn.ModuleList(
+            [
+                nn.GroupNorm(norm_channels, out_channels)
+                for _ in range(num_layers)
+            ]
+        )
+
+        self.attentions = nn.ModuleList(
+            [
+                nn.MultiheadAttention(out_channels, num_heads, batch_first=True)
+                for _ in range(num_layers)
+            ]
+        )
+
+        if self.cross_attn:
+            assert context_dim is not None, "Context Dimension must be passed for cross attention"
+            self.cross_attention_norms = nn.ModuleList(
+                [nn.GroupNorm(norm_channels, out_channels)
+                 for _ in range(num_layers)]
+            )
+            self.cross_attentions = nn.ModuleList(
+                [nn.MultiheadAttention(out_channels, num_heads, batch_first=True)
+                 for _ in range(num_layers)]
+            )
+            self.context_proj = nn.ModuleList(
+                [nn.Linear(context_dim, out_channels)
+                 for _ in range(num_layers)]
+            )
+        self.residual_input_conv = nn.ModuleList(
+            [
+                nn.Conv2d(in_channels if i == 0 else out_channels, out_channels, kernel_size=1)
+                for i in range(num_layers)
+            ]
+        )
+        self.up_sample_conv = nn.ConvTranspose2d(in_channels // 2, in_channels // 2,
+                                                 4, 2, 1) \
+            if self.up_sample else nn.Identity()
+
+    def forward(self, x, out_down=None, t_emb=None, context=None):
+        x = self.up_sample_conv(x)
+        if out_down is not None:
+            x = torch.cat([x, out_down], dim=1)
+
+        out = x
+        for i in range(self.num_layers):
+            # Resnet
+            resnet_input = out
+            out = self.resnet_conv_first[i](out)
+            if self.t_emb_dim is not None:
+                out = out + self.t_emb_layers[i](t_emb)[:, :, None, None]
+            out = self.resnet_conv_second[i](out)
+            out = out + self.residual_input_conv[i](resnet_input)
+            # Self Attention
+            batch_size, channels, h, w = out.shape
+            in_attn = out.reshape(batch_size, channels, h * w)
+            in_attn = self.attention_norms[i](in_attn)
+            in_attn = in_attn.transpose(1, 2)
+            out_attn, _ = self.attentions[i](in_attn, in_attn, in_attn)
+            out_attn = out_attn.transpose(1, 2).reshape(batch_size, channels, h, w)
+            out = out + out_attn
+            # Cross Attention
+            if self.cross_attn:
+                assert context is not None, "context cannot be None if cross attention layers are used"
+                batch_size, channels, h, w = out.shape
+                in_attn = out.reshape(batch_size, channels, h * w)
+                in_attn = self.cross_attention_norms[i](in_attn)
+                in_attn = in_attn.transpose(1, 2)
+                assert len(context.shape) == 3, \
+                    "Context shape does not match B,_,CONTEXT_DIM"
+                assert context.shape[0] == x.shape[0] and context.shape[-1] == self.context_dim, \
+                    "Context shape does not match B,_,CONTEXT_DIM"
+                context_proj = self.context_proj[i](context)
+                out_attn, _ = self.cross_attentions[i](in_attn, context_proj, context_proj)
+                out_attn = out_attn.transpose(1, 2).reshape(batch_size, channels, h, w)
+                out = out + out_attn
+
+        return out
+
+
+
+
+
+================================================
+FILE: model/discriminator.py
+================================================
+import torch
+import torch.nn as nn
+
+
+class Discriminator(nn.Module):
+    r"""
+    PatchGAN Discriminator.
+    Rather than taking IMG_CHANNELSxIMG_HxIMG_W all the way to
+    1 scalar value , we instead predict grid of values.
+    Where each grid is prediction of how likely
+    the discriminator thinks that the image patch corresponding
+    to the grid cell is real
+    """
+    
+    def __init__(self, im_channels=3,
+                 conv_channels=[64, 128, 256],
+                 kernels=[4,4,4,4],
+                 strides=[2,2,2,1],
+                 paddings=[1,1,1,1]):
+        super().__init__()
+        self.im_channels = im_channels
+        activation = nn.LeakyReLU(0.2)
+        layers_dim = [self.im_channels] + conv_channels + [1]
+        self.layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(layers_dim[i], layers_dim[i + 1],
+                          kernel_size=kernels[i],
+                          stride=strides[i],
+                          padding=paddings[i],
+                          bias=False if i !=0 else True),
+                nn.BatchNorm2d(layers_dim[i + 1]) if i != len(layers_dim) - 2 and i != 0 else nn.Identity(),
+                activation if i != len(layers_dim) - 2 else nn.Identity()
+            )
+            for i in range(len(layers_dim) - 1)
+        ])
+    
+    def forward(self, x):
+        out = x
+        for layer in self.layers:
+            out = layer(out)
+        return out
+
+
+if __name__ == '__main__':
+    x = torch.randn((2,3, 256, 256))
+    prob = Discriminator(im_channels=3)(x)
+    print(prob.shape)
+
+
+
+================================================
+FILE: model/lpips.py
+================================================
+from __future__ import absolute_import
+from collections import namedtuple
+import torch
+import torch.nn as nn
+import torch.nn.init as init
+from torch.autograd import Variable
+import numpy as np
+import torch.nn
+import torchvision
+
+# Taken from https://github.com/richzhang/PerceptualSimilarity/blob/master/lpips/lpips.py
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+if torch.backends.mps.is_available():
+    device = torch.device('mps')
+    print('Using mps')
+
+def spatial_average(in_tens, keepdim=True):
+    return in_tens.mean([2, 3], keepdim=keepdim)
+
+
+class vgg16(torch.nn.Module):
+    def __init__(self, requires_grad=False, pretrained=True):
+        super(vgg16, self).__init__()
+        # Load pretrained vgg model from torchvision
+        vgg_pretrained_features = torchvision.models.vgg16(pretrained=pretrained).features
+        self.slice1 = torch.nn.Sequential()
+        self.slice2 = torch.nn.Sequential()
+        self.slice3 = torch.nn.Sequential()
+        self.slice4 = torch.nn.Sequential()
+        self.slice5 = torch.nn.Sequential()
+        self.N_slices = 5
+        for x in range(4):
+            self.slice1.add_module(str(x), vgg_pretrained_features[x])
+        for x in range(4, 9):
+            self.slice2.add_module(str(x), vgg_pretrained_features[x])
+        for x in range(9, 16):
+            self.slice3.add_module(str(x), vgg_pretrained_features[x])
+        for x in range(16, 23):
+            self.slice4.add_module(str(x), vgg_pretrained_features[x])
+        for x in range(23, 30):
+            self.slice5.add_module(str(x), vgg_pretrained_features[x])
+        
+        # Freeze vgg model
+        if not requires_grad:
+            for param in self.parameters():
+                param.requires_grad = False
+    
+    def forward(self, X):
+        # Return output of vgg features
+        h = self.slice1(X)
+        h_relu1_2 = h
+        h = self.slice2(h)
+        h_relu2_2 = h
+        h = self.slice3(h)
+        h_relu3_3 = h
+        h = self.slice4(h)
+        h_relu4_3 = h
+        h = self.slice5(h)
+        h_relu5_3 = h
+        vgg_outputs = namedtuple("VggOutputs", ['relu1_2', 'relu2_2', 'relu3_3', 'relu4_3', 'relu5_3'])
+        out = vgg_outputs(h_relu1_2, h_relu2_2, h_relu3_3, h_relu4_3, h_relu5_3)
+        return out
+
+
+# Learned perceptual metric
+class LPIPS(nn.Module):
+    def __init__(self, net='vgg', version='0.1', use_dropout=True):
+        super(LPIPS, self).__init__()
+        self.version = version
+        # Imagenet normalization
+        self.scaling_layer = ScalingLayer()
+        ########################
+        
+        # Instantiate vgg model
+        self.chns = [64, 128, 256, 512, 512]
+        self.L = len(self.chns)
+        self.net = vgg16(pretrained=True, requires_grad=False)
+        
+        # Add 1x1 convolutional Layers
+        self.lin0 = NetLinLayer(self.chns[0], use_dropout=use_dropout)
+        self.lin1 = NetLinLayer(self.chns[1], use_dropout=use_dropout)
+        self.lin2 = NetLinLayer(self.chns[2], use_dropout=use_dropout)
+        self.lin3 = NetLinLayer(self.chns[3], use_dropout=use_dropout)
+        self.lin4 = NetLinLayer(self.chns[4], use_dropout=use_dropout)
+        self.lins = [self.lin0, self.lin1, self.lin2, self.lin3, self.lin4]
+        self.lins = nn.ModuleList(self.lins)
+        ########################
+        
+        # Load the weights of trained LPIPS model
+        import inspect
+        import os
+        model_path = os.path.abspath(
+            os.path.join(inspect.getfile(self.__init__), '..', 'weights/v%s/%s.pth' % (version, net)))
+        print('Loading model from: %s' % model_path)
+        self.load_state_dict(torch.load(model_path, map_location=device), strict=False)
+        ########################
+        
+        # Freeze all parameters
+        self.eval()
+        for param in self.parameters():
+            param.requires_grad = False
+        ########################
+    
+    def forward(self, in0, in1, normalize=False):
+        # Scale the inputs to -1 to +1 range if needed
+        if normalize:  # turn on this flag if input is [0,1] so it can be adjusted to [-1, +1]
+            in0 = 2 * in0 - 1
+            in1 = 2 * in1 - 1
+        ########################
+        
+        # Normalize the inputs according to imagenet normalization
+        in0_input, in1_input = self.scaling_layer(in0), self.scaling_layer(in1)
+        ########################
+        
+        # Get VGG outputs for image0 and image1
+        outs0, outs1 = self.net.forward(in0_input), self.net.forward(in1_input)
+        feats0, feats1, diffs = {}, {}, {}
+        ########################
+        
+        # Compute Square of Difference for each layer output
+        for kk in range(self.L):
+            feats0[kk], feats1[kk] = torch.nn.functional.normalize(outs0[kk], dim=1), torch.nn.functional.normalize(
+                outs1[kk])
+            diffs[kk] = (feats0[kk] - feats1[kk]) ** 2
+        ########################
+        
+        # 1x1 convolution followed by spatial average on the square differences
+        res = [spatial_average(self.lins[kk](diffs[kk]), keepdim=True) for kk in range(self.L)]
+        val = 0
+        
+        # Aggregate the results of each layer
+        for l in range(self.L):
+            val += res[l]
+        return val
+
+
+class ScalingLayer(nn.Module):
+    def __init__(self):
+        super(ScalingLayer, self).__init__()
+        # Imagnet normalization for (0-1)
+        # mean = [0.485, 0.456, 0.406]
+        # std = [0.229, 0.224, 0.225]
+        self.register_buffer('shift', torch.Tensor([-.030, -.088, -.188])[None, :, None, None])
+        self.register_buffer('scale', torch.Tensor([.458, .448, .450])[None, :, None, None])
+    
+    def forward(self, inp):
+        return (inp - self.shift) / self.scale
+
+
+class NetLinLayer(nn.Module):
+    ''' A single linear layer which does a 1x1 conv '''
+    
+    def __init__(self, chn_in, chn_out=1, use_dropout=False):
+        super(NetLinLayer, self).__init__()
+        
+        layers = [nn.Dropout(), ] if (use_dropout) else []
+        layers += [nn.Conv2d(chn_in, chn_out, 1, stride=1, padding=0, bias=False), ]
+        self.model = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        out = self.model(x)
+        return out
+
+
+
+================================================
+FILE: model/patch_embed.py
+================================================
+import torch
+import torch.nn as nn
+from einops import rearrange
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+def get_patch_position_embedding(pos_emb_dim, grid_size, device):
+    assert pos_emb_dim % 4 == 0, 'Position embedding dimension must be divisible by 4'
+    grid_size_h, grid_size_w = grid_size
+    grid_h = torch.arange(grid_size_h, dtype=torch.float32, device=device)
+    grid_w = torch.arange(grid_size_w, dtype=torch.float32, device=device)
+    grid = torch.meshgrid(grid_h, grid_w, indexing='ij')
+    grid = torch.stack(grid, dim=0)
+
+    # grid_h_positions -> (Number of patch tokens,)
+    grid_h_positions = grid[0].reshape(-1)
+    grid_w_positions = grid[1].reshape(-1)
+
+    # factor = 10000^(2i/d_model)
+    factor = 10000 ** ((torch.arange(
+        start=0,
+        end=pos_emb_dim // 4,
+        dtype=torch.float32,
+        device=device) / (pos_emb_dim // 4))
+    )
+
+    grid_h_emb = grid_h_positions[:, None].repeat(1, pos_emb_dim // 4) / factor
+    grid_h_emb = torch.cat([torch.sin(grid_h_emb), torch.cos(grid_h_emb)], dim=-1)
+    # grid_h_emb -> (Number of patch tokens, pos_emb_dim // 2)
+
+    grid_w_emb = grid_w_positions[:, None].repeat(1, pos_emb_dim // 4) / factor
+    grid_w_emb = torch.cat([torch.sin(grid_w_emb), torch.cos(grid_w_emb)], dim=-1)
+    pos_emb = torch.cat([grid_h_emb, grid_w_emb], dim=-1)
+
+    # pos_emb -> (Number of patch tokens, pos_emb_dim)
+    return pos_emb
+
+
+class PatchEmbedding(nn.Module):
+    r"""
+    Layer to take in the input image and do the following:
+        1.  Transform grid of image patches into a sequence of patches.
+            Number of patches are decided based on image height,width and
+            patch height, width.
+        2. Add positional embedding to the above sequence
+    """
+
+    def __init__(self,
+                 image_height,
+                 image_width,
+                 im_channels,
+                 patch_height,
+                 patch_width,
+                 hidden_size):
+        super().__init__()
+        self.image_height = image_height
+        self.image_width = image_width
+        self.im_channels = im_channels
+
+        self.hidden_size = hidden_size
+
+        self.patch_height = patch_height
+        self.patch_width = patch_width
+
+        # Input dimension for Patch Embedding FC Layer
+        patch_dim = self.im_channels * self.patch_height * self.patch_width
+        self.patch_embed = nn.Sequential(
+            nn.Linear(patch_dim, self.hidden_size)
+        )
+
+        ############################
+        # DiT Layer Initialization #
+        ############################
+        nn.init.xavier_uniform_(self.patch_embed[0].weight)
+        nn.init.constant_(self.patch_embed[0].bias, 0)
+
+    def forward(self, x):
+        grid_size_h = self.image_height // self.patch_height
+        grid_size_w = self.image_width // self.patch_width
+
+        # B, C, H, W -> B, (Patches along height * Patches along width), Patch Dimension
+        # Number of tokens = Patches along height * Patches along width
+        out = rearrange(x, 'b c (nh ph) (nw pw) -> b (nh nw) (ph pw c)',
+                        ph=self.patch_height,
+                        pw=self.patch_width)
+
+        # BxNumber of tokens x Patch Dimension -> B x Number of tokens x Transformer Dimension
+        out = self.patch_embed(out)
+
+        # Add 2d sinusoidal position embeddings
+        pos_embed = get_patch_position_embedding(pos_emb_dim=self.hidden_size,
+                                                 grid_size=(grid_size_h, grid_size_w),
+                                                 device=x.device)
+        out += pos_embed
+        return out
+
+
+
+
+================================================
+FILE: model/transformer.py
+================================================
+import torch
+import torch.nn as nn
+from model.patch_embed import PatchEmbedding
+from model.transformer_layer import TransformerLayer
+from einops import rearrange
+
+
+def get_time_embedding(time_steps, temb_dim):
+    r"""
+    Convert time steps tensor into an embedding using the
+    sinusoidal time embedding formula
+    :param time_steps: 1D tensor of length batch size
+    :param temb_dim: Dimension of the embedding
+    :return: BxD embedding representation of B time steps
+    """
+    assert temb_dim % 2 == 0, "time embedding dimension must be divisible by 2"
+
+    # factor = 10000^(2i/d_model)
+    factor = 10000 ** ((torch.arange(
+        start=0,
+        end=temb_dim // 2,
+        dtype=torch.float32,
+        device=time_steps.device) / (temb_dim // 2))
+    )
+
+    # pos / factor
+    # timesteps B -> B, 1 -> B, temb_dim
+    t_emb = time_steps[:, None].repeat(1, temb_dim // 2) / factor
+    t_emb = torch.cat([torch.sin(t_emb), torch.cos(t_emb)], dim=-1)
+    return t_emb
+
+
+class DIT(nn.Module):
+    def __init__(self, im_size, im_channels, config):
+        super().__init__()
+
+        num_layers = config['num_layers']
+        self.image_height = im_size
+        self.image_width = im_size
+        self.im_channels = im_channels
+        self.hidden_size = config['hidden_size']
+        self.patch_height = config['patch_size']
+        self.patch_width = config['patch_size']
+
+        self.timestep_emb_dim = config['timestep_emb_dim']
+
+        # Number of patches along height and width
+        self.nh = self.image_height // self.patch_height
+        self.nw = self.image_width // self.patch_width
+
+        # Patch Embedding Block
+        self.patch_embed_layer = PatchEmbedding(image_height=self.image_height,
+                                                image_width=self.image_width,
+                                                im_channels=self.im_channels,
+                                                patch_height=self.patch_height,
+                                                patch_width=self.patch_width,
+                                                hidden_size=self.hidden_size)
+
+        # Initial projection from sinusoidal time embedding
+        self.t_proj = nn.Sequential(
+            nn.Linear(self.timestep_emb_dim, self.hidden_size),
+            nn.SiLU(),
+            nn.Linear(self.hidden_size, self.hidden_size)
+        )
+
+        # All Transformer Layers
+        self.layers = nn.ModuleList([
+            TransformerLayer(config) for _ in range(num_layers)
+        ])
+
+        # Final normalization for unpatchify block
+        self.norm = nn.LayerNorm(self.hidden_size, elementwise_affine=False, eps=1E-6)
+
+        # Scale and Shift parameters for the norm
+        self.adaptive_norm_layer = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(self.hidden_size, 2 * self.hidden_size, bias=True)
+        )
+
+        # Final Linear Layer
+        self.proj_out = nn.Linear(self.hidden_size,
+                                  self.patch_height * self.patch_width * self.im_channels)
+
+        ############################
+        # DiT Layer Initialization #
+        ############################
+        nn.init.normal_(self.t_proj[0].weight, std=0.02)
+        nn.init.normal_(self.t_proj[2].weight, std=0.02)
+
+        nn.init.constant_(self.adaptive_norm_layer[-1].weight, 0)
+        nn.init.constant_(self.adaptive_norm_layer[-1].bias, 0)
+
+        nn.init.constant_(self.proj_out.weight, 0)
+        nn.init.constant_(self.proj_out.bias, 0)
+
+    def forward(self, x, t):
+        # Patchify
+        out = self.patch_embed_layer(x)
+
+        # Compute Timestep representation
+        # t_emb -> (Batch, timestep_emb_dim)
+        t_emb = get_time_embedding(torch.as_tensor(t).long(), self.timestep_emb_dim)
+        # (Batch, timestep_emb_dim) -> (Batch, hidden_size)
+        t_emb = self.t_proj(t_emb)
+
+        # Go through the transformer layers
+        for layer in self.layers:
+            out = layer(out, t_emb)
+
+        # Shift and scale predictions for output normalization
+        pre_mlp_shift, pre_mlp_scale = self.adaptive_norm_layer(t_emb).chunk(2, dim=1)
+        out = (self.norm(out) * (1 + pre_mlp_scale.unsqueeze(1)) +
+               pre_mlp_shift.unsqueeze(1))
+
+        # Unpatchify
+        # (B,patches,hidden_size) -> (B,patches,channels * patch_width * patch_height)
+        out = self.proj_out(out)
+        out = rearrange(out, 'b (nh nw) (ph pw c) -> b c (nh ph) (nw pw)',
+                        ph=self.patch_height,
+                        pw=self.patch_width,
+                        nw=self.nw,
+                        nh=self.nh)
+        return out
+
+
+
+================================================
+FILE: model/transformer_layer.py
+================================================
+import torch.nn as nn
+from model.attention import Attention
+
+
+class TransformerLayer(nn.Module):
+    r"""
+    Transformer block which is just doing the following based on VIT
+        1. LayerNorm followed by Attention
+        2. LayerNorm followed by Feed forward Block
+        Both these also have residuals added to them
+
+        For DiT we additionally have
+        1. Layernorm mlp to predict layernorm affine parameters from
+        2. Same Layernorm mlp to also predict scale parameters for outputs
+            of both mlp/attention prior to residual connection.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.hidden_size = config['hidden_size']
+
+        ff_hidden_dim = 4 * self.hidden_size
+
+        # Layer norm for attention block
+        self.att_norm = nn.LayerNorm(self.hidden_size, elementwise_affine=False, eps=1E-6)
+
+        self.attn_block = Attention(config)
+
+        # Layer norm for mlp block
+        self.ff_norm = nn.LayerNorm(self.hidden_size, elementwise_affine=False, eps=1E-6)
+
+        self.mlp_block = nn.Sequential(
+            nn.Linear(self.hidden_size, ff_hidden_dim),
+            nn.GELU(approximate='tanh'),
+            nn.Linear(ff_hidden_dim, self.hidden_size),
+        )
+
+        # Scale Shift Parameter predictions for this layer
+        # 1. Scale and shift parameters for layernorm of attention (2 * hidden_size)
+        # 2. Scale and shift parameters for layernorm of mlp (2 * hidden_size)
+        # 3. Scale for output of attention prior to residual connection (hidden_size)
+        # 4. Scale for output of mlp prior to residual connection (hidden_size)
+        # Total 6 * hidden_size
+        self.adaptive_norm_layer = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(self.hidden_size, 6 * self.hidden_size, bias=True)
+        )
+
+        ############################
+        # DiT Layer Initialization #
+        ############################
+        nn.init.xavier_uniform_(self.mlp_block[0].weight)
+        nn.init.constant_(self.mlp_block[0].bias, 0)
+        nn.init.xavier_uniform_(self.mlp_block[-1].weight)
+        nn.init.constant_(self.mlp_block[-1].bias, 0)
+
+        nn.init.constant_(self.adaptive_norm_layer[-1].weight, 0)
+        nn.init.constant_(self.adaptive_norm_layer[-1].bias, 0)
+
+    def forward(self, x, condition):
+        scale_shift_params = self.adaptive_norm_layer(condition).chunk(6, dim=1)
+        (pre_attn_shift, pre_attn_scale, post_attn_scale,
+         pre_mlp_shift, pre_mlp_scale, post_mlp_scale) = scale_shift_params
+        out = x
+        attn_norm_output = (self.att_norm(out) * (1 + pre_attn_scale.unsqueeze(1))
+                            + pre_attn_shift.unsqueeze(1))
+        out = out + post_attn_scale.unsqueeze(1) * self.attn_block(attn_norm_output)
+        mlp_norm_output = (self.ff_norm(out) * (1 + pre_mlp_scale.unsqueeze(1)) +
+                           pre_mlp_shift.unsqueeze(1))
+        out = out + post_mlp_scale.unsqueeze(1) * self.mlp_block(mlp_norm_output)
+        return out
+
+
+
+================================================
+FILE: model/vae.py
+================================================
+import torch
+import torch.nn as nn
+from model.blocks import DownBlock, MidBlock, UpBlock
+
+
+class VAE(nn.Module):
+    def __init__(self, im_channels, model_config):
+        super().__init__()
+        self.down_channels = model_config['down_channels']
+        self.mid_channels = model_config['mid_channels']
+        self.down_sample = model_config['down_sample']
+        self.num_down_layers = model_config['num_down_layers']
+        self.num_mid_layers = model_config['num_mid_layers']
+        self.num_up_layers = model_config['num_up_layers']
+
+        # To disable attention in Downblock of Encoder and Upblock of Decoder
+        self.attns = model_config['attn_down']
+
+        # Latent Dimension
+        self.z_channels = model_config['z_channels']
+        self.norm_channels = model_config['norm_channels']
+        self.num_heads = model_config['num_heads']
+
+        # Assertion to validate the channel information
+        assert self.mid_channels[0] == self.down_channels[-1]
+        assert self.mid_channels[-1] == self.down_channels[-1]
+        assert len(self.down_sample) == len(self.down_channels) - 1
+        assert len(self.attns) == len(self.down_channels) - 1
+
+        # Wherever we use downsampling in encoder correspondingly use
+        # upsampling in decoder
+        self.up_sample = list(reversed(self.down_sample))
+
+        ##################### Encoder ######################
+        self.encoder_conv_in = nn.Conv2d(im_channels, self.down_channels[0], kernel_size=3, padding=(1, 1))
+
+        # Downblock + Midblock
+        self.encoder_layers = nn.ModuleList([])
+        for i in range(len(self.down_channels) - 1):
+            self.encoder_layers.append(DownBlock(self.down_channels[i], self.down_channels[i + 1],
+                                                 t_emb_dim=None, down_sample=self.down_sample[i],
+                                                 num_heads=self.num_heads,
+                                                 num_layers=self.num_down_layers,
+                                                 attn=self.attns[i],
+                                                 norm_channels=self.norm_channels))
+
+        self.encoder_mids = nn.ModuleList([])
+        for i in range(len(self.mid_channels) - 1):
+            self.encoder_mids.append(MidBlock(self.mid_channels[i], self.mid_channels[i + 1],
+                                              t_emb_dim=None,
+                                              num_heads=self.num_heads,
+                                              num_layers=self.num_mid_layers,
+                                              norm_channels=self.norm_channels))
+
+        self.encoder_norm_out = nn.GroupNorm(self.norm_channels, self.down_channels[-1])
+        self.encoder_conv_out = nn.Conv2d(self.down_channels[-1], 2 * self.z_channels, kernel_size=3, padding=1)
+
+        # Latent Dimension is 2*Latent because we are predicting mean & variance
+        self.pre_quant_conv = nn.Conv2d(2 * self.z_channels, 2 * self.z_channels, kernel_size=1)
+        ####################################################
+
+        ##################### Decoder ######################
+        self.post_quant_conv = nn.Conv2d(self.z_channels, self.z_channels, kernel_size=1)
+        self.decoder_conv_in = nn.Conv2d(self.z_channels, self.mid_channels[-1], kernel_size=3, padding=(1, 1))
+
+        # Midblock + Upblock
+        self.decoder_mids = nn.ModuleList([])
+        for i in reversed(range(1, len(self.mid_channels))):
+            self.decoder_mids.append(MidBlock(self.mid_channels[i], self.mid_channels[i - 1],
+                                              t_emb_dim=None,
+                                              num_heads=self.num_heads,
+                                              num_layers=self.num_mid_layers,
+                                              norm_channels=self.norm_channels))
+
+        self.decoder_layers = nn.ModuleList([])
+        for i in reversed(range(1, len(self.down_channels))):
+            self.decoder_layers.append(UpBlock(self.down_channels[i], self.down_channels[i - 1],
+                                               t_emb_dim=None, up_sample=self.down_sample[i - 1],
+                                               num_heads=self.num_heads,
+                                               num_layers=self.num_up_layers,
+                                               attn=self.attns[i - 1],
+                                               norm_channels=self.norm_channels))
+
+        self.decoder_norm_out = nn.GroupNorm(self.norm_channels, self.down_channels[0])
+        self.decoder_conv_out = nn.Conv2d(self.down_channels[0], im_channels, kernel_size=3, padding=1)
+
+    def encode(self, x):
+        out = self.encoder_conv_in(x)
+        for idx, down in enumerate(self.encoder_layers):
+            out = down(out)
+        for mid in self.encoder_mids:
+            out = mid(out)
+        out = self.encoder_norm_out(out)
+        out = nn.SiLU()(out)
+        out = self.encoder_conv_out(out)
+        out = self.pre_quant_conv(out)
+        mean, logvar = torch.chunk(out, 2, dim=1)
+        std = torch.exp(0.5 * logvar)
+        sample = mean + std * torch.randn(mean.shape).to(device=x.device)
+        return sample, out
+
+    def decode(self, z):
+        out = z
+        out = self.post_quant_conv(out)
+        out = self.decoder_conv_in(out)
+        for mid in self.decoder_mids:
+            out = mid(out)
+        for idx, up in enumerate(self.decoder_layers):
+            out = up(out)
+
+        out = self.decoder_norm_out(out)
+        out = nn.SiLU()(out)
+        out = self.decoder_conv_out(out)
+        return out
+
+    def forward(self, x):
+        z, encoder_output = self.encode(x)
+        out = self.decode(z)
+        return out, encoder_output
+
+
+
+
+================================================
+FILE: model/weights/v0.1/.gitkeep
+================================================
+
+
+
+================================================
+FILE: scheduler/__init__.py
+================================================
+
+
+
+================================================
+FILE: scheduler/linear_scheduler.py
+================================================
+import torch
+
+
+class LinearNoiseScheduler:
+    r"""
+    Class for the linear noise scheduler that is used in DDPM.
+    """
+
+    def __init__(self, num_timesteps, beta_start, beta_end):
+        self.num_timesteps = num_timesteps
+        self.beta_start = beta_start
+        self.beta_end = beta_end
+
+        self.betas = torch.linspace(beta_start, beta_end, num_timesteps)
+        self.alphas = 1. - self.betas
+        self.alpha_cum_prod = torch.cumprod(self.alphas, dim=0)
+        self.sqrt_alpha_cum_prod = torch.sqrt(self.alpha_cum_prod)
+        self.sqrt_one_minus_alpha_cum_prod = torch.sqrt(1 - self.alpha_cum_prod)
+
+    def add_noise(self, original, noise, t):
+        r"""
+        Forward method for diffusion
+        :param original: Image on which noise is to be applied
+        :param noise: Random Noise Tensor (from normal dist)
+        :param t: timestep of the forward process of shape -> (B,)
+        :return:
+        """
+        original_shape = original.shape
+        batch_size = original_shape[0]
+
+        sqrt_alpha_cum_prod = self.sqrt_alpha_cum_prod.to(original.device)[t].reshape(batch_size)
+        sqrt_one_minus_alpha_cum_prod = self.sqrt_one_minus_alpha_cum_prod.to(original.device)[t].reshape(batch_size)
+
+        # Reshape till (B,) becomes (B,1,1,1) if image is (B,C,H,W)
+        for _ in range(len(original_shape) - 1):
+            sqrt_alpha_cum_prod = sqrt_alpha_cum_prod.unsqueeze(-1)
+        for _ in range(len(original_shape) - 1):
+            sqrt_one_minus_alpha_cum_prod = sqrt_one_minus_alpha_cum_prod.unsqueeze(-1)
+
+        # Apply and Return Forward process equation
+        return (sqrt_alpha_cum_prod.to(original.device) * original
+                + sqrt_one_minus_alpha_cum_prod.to(original.device) * noise)
+
+    def sample_prev_timestep(self, xt, pred, t):
+        r"""
+            Use the noise prediction by model to get
+            xt-1 using xt and the noise predicted
+        :param xt: current timestep sample
+        :param pred: model noise prediction
+        :param t: current timestep we are at
+        :return:
+        """
+        x0 = ((xt - (self.sqrt_one_minus_alpha_cum_prod.to(xt.device)[t] * pred)) /
+              torch.sqrt(self.alpha_cum_prod.to(xt.device)[t]))
+        x0 = torch.clamp(x0, -1., 1.)
+
+        mean = xt - ((self.betas.to(xt.device)[t]) * pred) / (self.sqrt_one_minus_alpha_cum_prod.to(xt.device)[t])
+        mean = mean / torch.sqrt(self.alphas.to(xt.device)[t])
+
+        if t == 0:
+            return mean, x0
+        else:
+            variance = (1 - self.alpha_cum_prod.to(xt.device)[t - 1]) / (1.0 - self.alpha_cum_prod.to(xt.device)[t])
+            variance = variance * self.betas.to(xt.device)[t]
+            sigma = variance ** 0.5
+            z = torch.randn(xt.shape).to(xt.device)
+            return mean + sigma * z, x0
+
+
+
+================================================
+FILE: tools/__init__.py
+================================================
+
+
+
+================================================
+FILE: tools/infer_vae.py
+================================================
+import argparse
+import glob
+import os
+import pickle
+
+import torch
+import torchvision
+import yaml
+from torch.utils.data.dataloader import DataLoader
+from torchvision.utils import make_grid
+from tqdm import tqdm
+
+from dataset.celeb_dataset import CelebDataset
+from model.vae import VAE
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+if torch.backends.mps.is_available():
+    device = torch.device('mps')
+    print('Using mps')
+
+
+def infer(args):
+    ######## Read the config file #######
+    with open(args.config_path, 'r') as file:
+        try:
+            config = yaml.safe_load(file)
+        except yaml.YAMLError as exc:
+            print(exc)
+    print(config)
+
+    dataset_config = config['dataset_params']
+    autoencoder_config = config['autoencoder_params']
+    train_config = config['train_params']
+
+    im_dataset = CelebDataset(split='train',
+                                im_path=dataset_config['im_path'],
+                                im_size=dataset_config['im_size'],
+                                im_channels=dataset_config['im_channels'])
+
+    # This is only used for saving latents. Which as of now
+    # is not done in batches hence batch size 1
+    data_loader = DataLoader(im_dataset,
+                             batch_size=1,
+                             shuffle=False)
+
+    num_images = train_config['num_samples']
+    ngrid = train_config['num_grid_rows']
+
+    idxs = torch.randint(0, len(im_dataset) - 1, (num_images,))
+    ims = torch.cat([im_dataset[idx][None, :] for idx in idxs]).float()
+    ims = ims.to(device)
+
+    model = VAE(im_channels=dataset_config['im_channels'],
+                model_config=autoencoder_config).to(device)
+    model.load_state_dict(torch.load(os.path.join(train_config['task_name'],
+                                                  train_config['vae_autoencoder_ckpt_name']),
+                                     map_location=device))
+    model.eval()
+
+    with torch.no_grad():
+
+        encoded_output, _ = model.encode(ims)
+        decoded_output = model.decode(encoded_output)
+        encoded_output = torch.clamp(encoded_output, -1., 1.)
+        encoded_output = (encoded_output + 1) / 2
+        decoded_output = torch.clamp(decoded_output, -1., 1.)
+        decoded_output = (decoded_output + 1) / 2
+        ims = (ims + 1) / 2
+
+        encoder_grid = make_grid(encoded_output.cpu(), nrow=ngrid)
+        decoder_grid = make_grid(decoded_output.cpu(), nrow=ngrid)
+        input_grid = make_grid(ims.cpu(), nrow=ngrid)
+        encoder_grid = torchvision.transforms.ToPILImage()(encoder_grid)
+        decoder_grid = torchvision.transforms.ToPILImage()(decoder_grid)
+        input_grid = torchvision.transforms.ToPILImage()(input_grid)
+
+        input_grid.save(os.path.join(train_config['task_name'], 'input_samples.png'))
+        encoder_grid.save(os.path.join(train_config['task_name'], 'encoded_samples.png'))
+        decoder_grid.save(os.path.join(train_config['task_name'], 'reconstructed_samples.png'))
+
+        if train_config['save_latents']:
+            # save Latents (but in a very unoptimized way)
+            latent_path = os.path.join(train_config['task_name'], train_config['vae_latent_dir_name'])
+            latent_fnames = glob.glob(os.path.join(train_config['task_name'], train_config['vae_latent_dir_name'],
+                                                   '*.pkl'))
+            assert len(latent_fnames) == 0, 'Latents already present. Delete all latent files and re-run'
+            if not os.path.exists(latent_path):
+                os.mkdir(latent_path)
+            print('Saving Latents for {}'.format(dataset_config['name']))
+
+            fname_latent_map = {}
+            part_count = 0
+            count = 0
+            for idx, im in enumerate(tqdm(data_loader)):
+                _, encoded_output = model.encode(im.float().to(device))
+                fname_latent_map[im_dataset.images[idx]] = encoded_output.cpu()
+                # Save latents every 1000 images
+                if (count + 1) % 1000 == 0:
+                    pickle.dump(fname_latent_map, open(os.path.join(latent_path,
+                                                                    '{}.pkl'.format(part_count)), 'wb'))
+                    part_count += 1
+                    fname_latent_map = {}
+                count += 1
+            if len(fname_latent_map) > 0:
+                pickle.dump(fname_latent_map, open(os.path.join(latent_path,
+                                                                '{}.pkl'.format(part_count)), 'wb'))
+            print('Done saving latents')
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Arguments for vae inference')
+    parser.add_argument('--config', dest='config_path',
+                        default='config/celebhq.yaml', type=str)
+    args = parser.parse_args()
+    infer(args)
+
+
+
+================================================
+FILE: tools/sample_vae_dit.py
+================================================
+import torch
+import torchvision
+import argparse
+import yaml
+import os
+from torchvision.utils import make_grid
+from PIL import Image
+from tqdm import tqdm
+from model.vae import VAE
+from model.transformer import DIT
+from scheduler.linear_scheduler import LinearNoiseScheduler
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+if torch.backends.mps.is_available():
+    device = torch.device('mps')
+    print('Using mps')
+
+
+def sample(model, scheduler, train_config, dit_model_config,
+           autoencoder_model_config, diffusion_config, dataset_config, vae):
+    r"""
+    Sample stepwise by going backward one timestep at a time.
+    We save the x0 predictions
+    """
+    im_size = dataset_config['im_size'] // 2 ** sum(autoencoder_model_config['down_sample'])
+    xt = torch.randn((train_config['num_samples'],
+                      autoencoder_model_config['z_channels'],
+                      im_size,
+                      im_size)).to(device)
+
+    for i in tqdm(reversed(range(diffusion_config['num_timesteps']))):
+        # Get prediction of noise
+        noise_pred = model(xt, torch.as_tensor(i).unsqueeze(0).to(device))
+
+        # Use scheduler to get x0 and xt-1
+        xt, x0_pred = scheduler.sample_prev_timestep(xt, noise_pred, torch.as_tensor(i).to(device))
+
+        # Save x0
+        # ims = torch.clamp(xt, -1., 1.).detach().cpu()
+        if i == 0:
+            # Decode ONLY the final image to save time
+            ims = vae.to(device).decode(xt)
+        else:
+            ims = xt
+            ims = xt[:, :-1, :, :]
+
+        ims = torch.clamp(ims, -1., 1.).detach().cpu()
+        ims = (ims + 1) / 2
+
+        grid = make_grid(ims, nrow=train_config['num_grid_rows'])
+        img = torchvision.transforms.ToPILImage()(grid)
+
+        if not os.path.exists(os.path.join(train_config['task_name'], 'samples')):
+            os.mkdir(os.path.join(train_config['task_name'], 'samples'))
+        img.save(os.path.join(train_config['task_name'], 'samples', 'x0_{}.png'.format(i)))
+        img.close()
+
+
+def infer(args):
+    # Read the config file #
+    with open(args.config_path, 'r') as file:
+        try:
+            config = yaml.safe_load(file)
+        except yaml.YAMLError as exc:
+            print(exc)
+    print(config)
+    ########################
+
+    diffusion_config = config['diffusion_params']
+    dataset_config = config['dataset_params']
+    dit_model_config = config['dit_params']
+    autoencoder_model_config = config['autoencoder_params']
+    train_config = config['train_params']
+
+    # Create the noise scheduler
+    scheduler = LinearNoiseScheduler(num_timesteps=diffusion_config['num_timesteps'],
+                                     beta_start=diffusion_config['beta_start'],
+                                     beta_end=diffusion_config['beta_end'])
+
+    # Get latent image size
+    im_size = dataset_config['im_size'] // 2 ** sum(autoencoder_model_config['down_sample'])
+    model = DIT(im_size=im_size,
+                im_channels=autoencoder_model_config['z_channels'],
+                config=dit_model_config).to(device)
+
+    model.eval()
+
+    assert os.path.exists(os.path.join(train_config['task_name'],
+                                       train_config['dit_ckpt_name'])), "Train DiT first"
+
+    model.load_state_dict(torch.load(os.path.join(train_config['task_name'],
+                                                  train_config['dit_ckpt_name']),
+                                     map_location=device))
+    print('Loaded dit checkpoint')
+
+    # Create output directories
+    if not os.path.exists(train_config['task_name']):
+        os.mkdir(train_config['task_name'])
+
+    vae = VAE(im_channels=dataset_config['im_channels'],
+              model_config=autoencoder_model_config)
+    vae.eval()
+
+    # Load vae if found
+    assert os.path.exists(os.path.join(train_config['task_name'], train_config['vae_autoencoder_ckpt_name'])), \
+        "VAE checkpoint not present. Train VAE first."
+    vae.load_state_dict(torch.load(os.path.join(train_config['task_name'],
+                                                train_config['vae_autoencoder_ckpt_name']),
+                                   map_location=device), strict=True)
+    print('Loaded vae checkpoint')
+
+    with torch.no_grad():
+        sample(model, scheduler, train_config, dit_model_config,
+               autoencoder_model_config, diffusion_config, dataset_config, vae)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Arguments for dit image generation')
+    parser.add_argument('--config', dest='config_path',
+                        default='config/celebhq.yaml', type=str)
+    args = parser.parse_args()
+    infer(args)
+
+
+
+================================================
+FILE: tools/train_vae.py
+================================================
+import yaml
+import argparse
+import torch
+import random
+import torchvision
+import os
+import numpy as np
+from tqdm import tqdm
+from model.vae import VAE
+from model.lpips import LPIPS
+from model.discriminator import Discriminator
+from torch.utils.data.dataloader import DataLoader
+from dataset.celeb_dataset import CelebDataset
+from torch.optim import Adam
+from torchvision.utils import make_grid
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+if torch.backends.mps.is_available():
+    device = torch.device('mps')
+    print('Using mps')
+
+
+def train(args):
+    # Read the config file #
+    with open(args.config_path, 'r') as file:
+        try:
+            config = yaml.safe_load(file)
+        except yaml.YAMLError as exc:
+            print(exc)
+    print(config)
+
+    dataset_config = config['dataset_params']
+    autoencoder_config = config['autoencoder_params']
+    train_config = config['train_params']
+
+    # Set the desired seed value #
+    seed = train_config['seed']
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if device == 'cuda':
+        torch.cuda.manual_seed_all(seed)
+    #############################
+
+    # Create the model and dataset #
+    model = VAE(im_channels=dataset_config['im_channels'],
+                model_config=autoencoder_config).to(device)
+    # Create the dataset
+    im_dataset = CelebDataset(split='train',
+                              im_path=dataset_config['im_path'],
+                              im_size=dataset_config['im_size'],
+                              im_channels=dataset_config['im_channels'])
+
+    data_loader = DataLoader(im_dataset,
+                             batch_size=train_config['autoencoder_batch_size'],
+                             shuffle=True)
+
+    # Create output directories
+    if not os.path.exists(train_config['task_name']):
+        os.mkdir(train_config['task_name'])
+
+    num_epochs = train_config['autoencoder_epochs']
+
+    # L1/L2 loss for Reconstruction
+    recon_criterion = torch.nn.MSELoss()
+    # Disc Loss can even be BCEWithLogits
+    disc_criterion = torch.nn.MSELoss()
+
+    # No need to freeze lpips as lpips.py takes care of that
+    lpips_model = LPIPS().eval().to(device)
+    discriminator = Discriminator(im_channels=dataset_config['im_channels']).to(device)
+
+    if os.path.exists(os.path.join(train_config['task_name'],
+                                   train_config['vae_autoencoder_ckpt_name'])):
+        model.load_state_dict(torch.load(os.path.join(train_config['task_name'],
+                                                      train_config['vae_autoencoder_ckpt_name']),
+                                         map_location=device))
+        print('Loaded autoencoder from checkpoint')
+
+    if os.path.exists(os.path.join(train_config['task_name'],
+                                   train_config['vae_discriminator_ckpt_name'])):
+        discriminator.load_state_dict(torch.load(os.path.join(train_config['task_name'],
+                                                              train_config['vae_discriminator_ckpt_name']),
+                                                 map_location=device))
+        print('Loaded discriminator from checkpoint')
+
+    optimizer_d = Adam(discriminator.parameters(), lr=train_config['autoencoder_lr'], betas=(0.5, 0.999))
+    optimizer_g = Adam(model.parameters(), lr=train_config['autoencoder_lr'], betas=(0.5, 0.999))
+
+    disc_step_start = train_config['disc_start']
+    step_count = 0
+
+    # This is for accumulating gradients incase the images are huge
+    # And one cant afford higher batch sizes
+    acc_steps = train_config['autoencoder_acc_steps']
+    image_save_steps = train_config['autoencoder_img_save_steps']
+    img_save_count = 0
+
+    for epoch_idx in range(num_epochs):
+        recon_losses = []
+        perceptual_losses = []
+        disc_losses = []
+        gen_losses = []
+        losses = []
+
+        optimizer_g.zero_grad()
+        optimizer_d.zero_grad()
+
+        for im in tqdm(data_loader):
+            step_count += 1
+            im = im.float().to(device)
+
+            # Fetch autoencoders output(reconstructions)
+            model_output = model(im)
+            output, encoder_output = model_output
+
+            # Image Saving Logic
+            if step_count % image_save_steps == 0 or step_count == 1:
+                sample_size = min(8, im.shape[0])
+                save_output = torch.clamp(output[:sample_size], -1., 1.).detach().cpu()
+                save_output = ((save_output + 1) / 2)
+                save_input = ((im[:sample_size] + 1) / 2).detach().cpu()
+
+                grid = make_grid(torch.cat([save_input, save_output], dim=0), nrow=sample_size)
+                img = torchvision.transforms.ToPILImage()(grid)
+                if not os.path.exists(os.path.join(train_config['task_name'], 'vae_autoencoder_samples')):
+                    os.mkdir(os.path.join(train_config['task_name'], 'vae_autoencoder_samples'))
+                img.save(os.path.join(train_config['task_name'], 'vae_autoencoder_samples',
+                                      'current_autoencoder_sample_{}.png'.format(img_save_count)))
+                img_save_count += 1
+                img.close()
+
+            ######### Optimize Generator ##########
+            # L2 Loss
+            recon_loss = recon_criterion(output, im)
+            recon_losses.append(recon_loss.item())
+            recon_loss = recon_loss / acc_steps
+
+            mean, logvar = torch.chunk(encoder_output, 2, dim=1)
+            kl_loss = torch.mean(0.5 * torch.sum(torch.exp(logvar) + mean ** 2 - 1 - logvar, dim=[1, 2, 3]))
+
+            g_loss = recon_loss + (train_config['kl_weight'] * kl_loss / acc_steps)
+
+            # Adversarial loss only if disc_step_start steps passed
+            if step_count > disc_step_start:
+                disc_fake_pred = discriminator(model_output[0])
+                disc_fake_loss = disc_criterion(disc_fake_pred,
+                                                torch.ones(disc_fake_pred.shape,
+                                                           device=disc_fake_pred.device))
+                gen_losses.append(train_config['disc_weight'] * disc_fake_loss.item())
+                g_loss += train_config['disc_weight'] * disc_fake_loss / acc_steps
+            lpips_loss = torch.mean(lpips_model(output, im))
+            perceptual_losses.append(train_config['perceptual_weight'] * lpips_loss.item())
+            g_loss += train_config['perceptual_weight'] * lpips_loss / acc_steps
+            losses.append(g_loss.item())
+            g_loss.backward()
+            #####################################
+
+            ######### Optimize Discriminator #######
+            if step_count > disc_step_start:
+                fake = output
+                disc_fake_pred = discriminator(fake.detach())
+                disc_real_pred = discriminator(im)
+                disc_fake_loss = disc_criterion(disc_fake_pred,
+                                                torch.zeros(disc_fake_pred.shape,
+                                                            device=disc_fake_pred.device))
+                disc_real_loss = disc_criterion(disc_real_pred,
+                                                torch.ones(disc_real_pred.shape,
+                                                           device=disc_real_pred.device))
+                disc_loss = train_config['disc_weight'] * (disc_fake_loss + disc_real_loss) / 2
+                disc_losses.append(disc_loss.item())
+                disc_loss = disc_loss / acc_steps
+                disc_loss.backward()
+                if step_count % acc_steps == 0:
+                    optimizer_d.step()
+                    optimizer_d.zero_grad()
+            #####################################
+
+            if step_count % acc_steps == 0:
+                optimizer_g.step()
+                optimizer_g.zero_grad()
+        optimizer_d.step()
+        optimizer_d.zero_grad()
+        optimizer_g.step()
+        optimizer_g.zero_grad()
+        if len(disc_losses) > 0:
+            print(
+                'Finished epoch: {} | Recon Loss : {:.4f} | Perceptual Loss : {:.4f} | '
+                'G Loss : {:.4f} | D Loss {:.4f}'.
+                format(epoch_idx + 1,
+                       np.mean(recon_losses),
+                       np.mean(perceptual_losses),
+                       np.mean(gen_losses),
+                       np.mean(disc_losses)))
+        else:
+            print('Finished epoch: {} | Recon Loss : {:.4f} | Perceptual Loss : {:.4f}'.
+                  format(epoch_idx + 1,
+                         np.mean(recon_losses),
+                         np.mean(perceptual_losses)))
+        torch.save(model.state_dict(), os.path.join(train_config['task_name'],
+                                                    train_config['vae_autoencoder_ckpt_name']))
+        torch.save(discriminator.state_dict(), os.path.join(train_config['task_name'],
+                                                            train_config['vae_discriminator_ckpt_name']))
+    print('Done Training...')
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Arguments for vae training')
+    parser.add_argument('--config', dest='config_path',
+                        default='config/celebhq.yaml', type=str)
+    args = parser.parse_args()
+    train(args)
+
+
+
+================================================
+FILE: tools/train_vae_dit.py
+================================================
+import torch
+import yaml
+import argparse
+import os
+import numpy as np
+from tqdm import tqdm
+from torch.optim import AdamW
+from dataset.celeb_dataset import CelebDataset
+from torch.utils.data import DataLoader
+from model.transformer import DIT
+from model.vae import VAE
+from scheduler.linear_scheduler import LinearNoiseScheduler
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+if torch.backends.mps.is_available():
+    device = torch.device('mps')
+    print('Using mps')
+
+
+def train(args):
+    # Read the config file #
+    with open(args.config_path, 'r') as file:
+        try:
+            config = yaml.safe_load(file)
+        except yaml.YAMLError as exc:
+            print(exc)
+    print(config)
+    ########################
+
+    diffusion_config = config['diffusion_params']
+    dataset_config = config['dataset_params']
+    dit_model_config = config['dit_params']
+    autoencoder_model_config = config['autoencoder_params']
+    train_config = config['train_params']
+
+    # Create the noise scheduler
+    scheduler = LinearNoiseScheduler(num_timesteps=diffusion_config['num_timesteps'],
+                                     beta_start=diffusion_config['beta_start'],
+                                     beta_end=diffusion_config['beta_end'])
+
+    im_dataset = CelebDataset(split='train',
+                              im_path=dataset_config['im_path'],
+                              im_size=dataset_config['im_size'],
+                              im_channels=dataset_config['im_channels'],
+                              use_latents=True,
+                              latent_path=os.path.join(train_config['task_name'],
+                                                       train_config['vae_latent_dir_name'])
+                              )
+
+    data_loader = DataLoader(im_dataset,
+                             batch_size=train_config['dit_batch_size'],
+                             shuffle=True)
+
+    # Instantiate the model
+    im_size = dataset_config['im_size'] // 2 ** sum(autoencoder_model_config['down_sample'])
+    model = DIT(im_size=im_size,
+                im_channels=autoencoder_model_config['z_channels'],
+                config=dit_model_config).to(device)
+    model.train()
+
+    if os.path.exists(os.path.join(train_config['task_name'],
+                                   train_config['dit_ckpt_name'])):
+        print('Loaded DiT checkpoint')
+        model.load_state_dict(torch.load(os.path.join(train_config['task_name'],
+                                                      train_config['dit_ckpt_name']),
+                                         map_location=device))
+
+    # Load VAE ONLY if latents are not to be used or are missing
+    if not im_dataset.use_latents:
+        print('Loading vae model as latents not present')
+        vae = VAE(im_channels=dataset_config['im_channels'],
+                  model_config=autoencoder_model_config).to(device)
+        vae.eval()
+        # Load vae if found
+        if os.path.exists(os.path.join(train_config['task_name'],
+                                       train_config['vae_autoencoder_ckpt_name'])):
+            print('Loaded vae checkpoint')
+            vae.load_state_dict(torch.load(os.path.join(
+                train_config['task_name'],
+                train_config['vae_autoencoder_ckpt_name']),
+                map_location=device))
+    # Specify training parameters
+    num_epochs = train_config['dit_epochs']
+    optimizer = AdamW(model.parameters(), lr=1E-5, weight_decay=0)
+    criterion = torch.nn.MSELoss()
+
+    # Run training
+    if not im_dataset.use_latents:
+        for param in vae.parameters():
+            param.requires_grad = False
+
+    acc_steps = train_config['dit_acc_steps']
+    for epoch_idx in range(num_epochs):
+        losses = []
+        step_count = 0
+        for im in tqdm(data_loader):
+            step_count += 1
+            im = im.float().to(device)
+            if im_dataset.use_latents:
+                mean, logvar = torch.chunk(im, 2, dim=1)
+                std = torch.exp(0.5 * logvar)
+                im = mean + std * torch.randn(mean.shape).to(device=im.device)
+            else:
+                with torch.no_grad():
+                    im, _ = vae.encode(im)
+
+            # Sample random noise
+            noise = torch.randn_like(im).to(device)
+
+            # Sample timestep
+            t = torch.randint(0, diffusion_config['num_timesteps'],
+                              (im.shape[0],)).to(device)
+
+            # Add noise to images according to timestep
+            noisy_im = scheduler.add_noise(im, noise, t)
+            pred = model(noisy_im, t)
+            loss = criterion(pred, noise)
+            losses.append(loss.item())
+            loss = loss / acc_steps
+            loss.backward()
+            if step_count % acc_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+        optimizer.step()
+        optimizer.zero_grad()
+        print('Finished epoch:{} | Loss : {:.4f}'.format(
+            epoch_idx + 1,
+            np.mean(losses)))
+        torch.save(model.state_dict(), os.path.join(train_config['task_name'],
+                                                    train_config['dit_ckpt_name']))
+
+    print('Done Training ...')
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Arguments for dit training')
+    parser.add_argument('--config', dest='config_path',
+                        default='config/celebhq.yaml', type=str)
+    args = parser.parse_args()
+    train(args)
+
+
+
+================================================
+FILE: utils/__init__.py
+================================================
+
+
+
+================================================
+FILE: utils/diffusion_utils.py
+================================================
+import pickle
+import glob
+import os
+import torch
+
+
+def load_latents(latent_path):
+    r"""
+    Simple utility to save latents to speed up ldm training
+    :param latent_path:
+    :return:
+    """
+    latent_maps = {}
+    for fname in glob.glob(os.path.join(latent_path, '*.pkl')):
+        s = pickle.load(open(fname, 'rb'))
+        for k, v in s.items():
+            latent_maps[k] = v[0]
+    return latent_maps
+
+
